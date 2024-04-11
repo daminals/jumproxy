@@ -7,9 +7,6 @@ import (
 	"crypto/sha256"
 	"flag"
 	"net"
-	// "time"
-
-	// "fmt"
 	"io"
 	"log"
 	"os"
@@ -19,17 +16,16 @@ import (
 
 const (
 	SALT       = "THIS IS A VERY SECURE SALT. ZEBRA SMARTPHONE BANANA CLOWN"
-	CHUNK_SIZE = 1024
 )
 
-type StreamReadWriter struct {
-	Source io.ReadWriter
+type EncryptedStream struct {
+	Source io.ReadWriteCloser // implements io.Reader, io.Writer, io.Closer
 	Cipher cipher.AEAD
 } 
 
 // Write implements io.Writer.
-func (self StreamReadWriter) Write(byteStream []byte) (n int, err error) {
-	log.Println("writing")
+func (self EncryptedStream) Write(byteStream []byte) (n int, err error) {
+	// log.Println("writing - encrypted stream")
 
 	// Number only used once
 	nonce := make([]byte, self.Cipher.NonceSize())
@@ -49,8 +45,8 @@ func (self StreamReadWriter) Write(byteStream []byte) (n int, err error) {
 	return 0, io.EOF
 }
 
-func (self StreamReadWriter) Read(byteStream []byte) (n int, err error) {
-	log.Println("reading")
+func (self EncryptedStream) Read(byteStream []byte) (n int, err error) {
+	// log.Println("reading - encrypted stream")
 
 	// read from the source stream (no buffer)
 	n, readErr := self.Source.Read(byteStream)
@@ -71,6 +67,10 @@ func (self StreamReadWriter) Read(byteStream []byte) (n int, err error) {
 	return len(decryptedStream), nil
 }
 
+func (self EncryptedStream) Close() error {
+	return self.Source.Close()
+}
+
 func main() {
 	// go run jumproxy.go [-l listenport] -k pwdfile destination port
 	listenport := flag.String("l", "", "listenport")
@@ -86,9 +86,7 @@ func main() {
 	destination := flag.Args()[0]
 	port := flag.Args()[1]
 
-	// read stdin
-	aesCipher := generateCipher(generateKey(*pwdfile))
-
+	aesCipher := generateCipher(generateKey(*pwdfile)) // generate aes cipher
 	if *listenport == "" {
 		client(aesCipher, destination, port)
 	} else {
@@ -97,7 +95,6 @@ func main() {
 }
 
 func client(aesCipher cipher.AEAD, destination, port string) { // take in pwdfile, destination, port
-	for { // loop until EOF or control c
 		// create a connection to destination:port
 		conn, err := net.Dial("tcp", destination+":"+port)
 		if err != nil {
@@ -105,23 +102,45 @@ func client(aesCipher cipher.AEAD, destination, port string) { // take in pwdfil
 		}
 
 		// open a stream writer with the server connection
-		streamWriter := StreamReadWriter{
+		streamWriter := EncryptedStream{
 			Source: conn,
 			Cipher: aesCipher,
 		}
 
-		// send the encrypted bytestream to the server
-		_, err = io.Copy(streamWriter, os.Stdin)
-		if err != nil {
-			log.Fatal(err)
-		}
+		stdInReader := io.ReadCloser(os.Stdin)
+		stdErrWriter := io.WriteCloser(os.Stderr)
+
+		// make a channel to track the connection
+		done := make(chan bool)
 
 		// read response from server
-		_, err = io.Copy(os.Stderr, streamWriter)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
+		go func () { // nonblocking recv from server -- get all responses from server
+			n, err := io.Copy(stdErrWriter, streamWriter)
+			done <- true
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			log.Println(n)
+		}()
+
+		// send the encrypted bytestream to the server
+		go func () {	
+			n, err := io.Copy(streamWriter, stdInReader)
+			done <- true
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Println(n)
+		}()
+
+	// wait until one of the connections closes
+	<- done
+
+	// close both connections
+	streamWriter.Close() // when this connection handler exits, close the connection
+	stdInReader.Close()
+	stdErrWriter.Close()
 }
 
 func server(aesCipher cipher.AEAD, listenport, destination, port string) { // take in pwdfile, listenport
@@ -138,7 +157,7 @@ func server(aesCipher cipher.AEAD, listenport, destination, port string) { // ta
 		if err != nil {
 			log.Fatal(err)
 		}
-		streamReader := StreamReadWriter{
+		streamReader := EncryptedStream{
 			Source: conn,
 			Cipher: aesCipher,
 		}
@@ -147,23 +166,44 @@ func server(aesCipher cipher.AEAD, listenport, destination, port string) { // ta
 	}
 }
 
-func handleConnection(streamReader StreamReadWriter, destination, port string) {
+func handleConnection(streamReader EncryptedStream, destination, port string) {
 	// create a two-way stream with destination:port
 	dst, err := net.Dial("tcp", destination+":"+port)
+	// none of these errors should be fatal, should just close the connection
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		return
 	}
 
-	// send decrypted bytes to destination:port
-	_, err = io.Copy(dst, streamReader) 
-	if err != nil {
-		log.Fatal(err)
-	}
+	// make a channel to track the connection
+	done := make(chan bool)	
 
-	// send the response back to the client
-	if _, err = io.Copy(streamReader, dst); err != nil {
-		log.Fatal(err)
-	}
+	go func () { // nonblcking recv from dst -- get all responses from dst
+			n, err := io.Copy(streamReader, dst) 
+			done <- true
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			log.Println(n)
+		}()
+
+	go func () {
+		// send decrypted bytes to destination:port
+		_, err = io.Copy(dst, streamReader)
+		done <- true
+		if err != nil {
+			log.Println(err)
+			return
+		} 
+	}()
+
+	// wait until one of the connections closes
+	<- done
+
+	// close both connections
+	streamReader.Close() // when this connection handler exits, close the connection
+	dst.Close()
 }
 
 // passphrase using PBKDF2
@@ -231,4 +271,4 @@ func decrypt(byteStream []byte, aesCipher cipher.AEAD) []byte {
 
 	log.Printf("%s", string(decryptedStream))
 	return decryptedStream
-}
+ }
