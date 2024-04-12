@@ -10,22 +10,40 @@ import (
 	"io"
 	"log"
 	"os"
+	"encoding/binary"
 
 	pbkdf2 "golang.org/x/crypto/pbkdf2"
 )
 
 const (
 	SALT       = "THIS IS A VERY SECURE SALT. ZEBRA SMARTPHONE BANANA CLOWN"
+	BUFFER_SIZE = 4 // 4 bytes to hold the length of the encrypted stream
 )
 
+
 type EncryptedStream struct {
-	Source io.ReadWriteCloser // implements io.Reader, io.Writer, io.Closer
-	Cipher cipher.AEAD
-} 
+	Source      io.ReadWriteCloser // implements io.Reader, io.Writer, io.Closer
+	Cipher      cipher.AEAD
+	Block 		 	cipher.Block
+	BufferSize  int
+}
+
+func NewEncryptedStream(source io.ReadWriteCloser, key []byte) *EncryptedStream {
+	block := generateCipherBlock(key)
+	cipher := generateCipher(block)
+
+	return &EncryptedStream{
+		Source:     source,
+		Cipher:     cipher,
+		Block:			block,
+		BufferSize: BUFFER_SIZE,
+	}
+}
 
 // Write implements io.Writer.
 func (self EncryptedStream) Write(byteStream []byte) (n int, err error) {
 	// log.Println("writing - encrypted stream")
+	streamLen := len(byteStream)
 
 	// Number only used once
 	nonce := make([]byte, self.Cipher.NonceSize())
@@ -36,18 +54,25 @@ func (self EncryptedStream) Write(byteStream []byte) (n int, err error) {
 	}
 
 	encryptedByteStream := self.Cipher.Seal(nonce, nonce, byteStream, nil)
+	encryptedStreamLen := len(encryptedByteStream)
+	// add a nice bufferSize byte head with the length of the encrypted stream
+	lenBuffer := make([]byte, self.BufferSize)
+	if len(encryptedByteStream) > 0 {
+		// format the length of the encrypted stream into a byte array
+		binary.LittleEndian.PutUint16(lenBuffer, uint16(encryptedStreamLen))
+		// append length of the encrypted stream to the encrypted stream
+		encryptedByteStream = append(lenBuffer, encryptedByteStream...)
+	}
 	n, writeErr := self.Source.Write(encryptedByteStream)
 
 	if n > 0 {
-		return len(byteStream), writeErr
+		return streamLen, writeErr
 	}
 
 	return 0, io.EOF
 }
 
 func (self EncryptedStream) Read(byteStream []byte) (n int, err error) {
-	// log.Println("reading - encrypted stream")
-
 	// read from the source stream (no buffer)
 	n, readErr := self.Source.Read(byteStream)
 	if n <= 0 {
@@ -55,16 +80,18 @@ func (self EncryptedStream) Read(byteStream []byte) (n int, err error) {
 	}
 	// decrypt the bytestream
 	ns := self.Cipher.NonceSize()
-	nonce, encryptedStream := byteStream[:ns], byteStream[ns:n]
+	// read the length of the encrypted stream
+	lenInBytes, stream := byteStream[:self.BufferSize], byteStream[self.BufferSize:n]
+	Streamlen := int(binary.LittleEndian.Uint16(lenInBytes)) // conver to int
+	nonce, encryptedStream := stream[:ns], stream[ns:Streamlen]
 
-	decryptedStream, err := self.Cipher.Open(nil, nonce, encryptedStream, nil)
+	decryptedBytes, err := self.Cipher.Open(nil, nonce, encryptedStream, nil)
 	if err != nil {
 		log.Println(err)
-		return len(decryptedStream), err
+		return len(decryptedBytes), err
 	}
-	log.Print(string(decryptedStream))
-	copy(byteStream, decryptedStream)
-	return len(decryptedStream), nil
+	copy(byteStream, decryptedBytes)
+	return len(decryptedBytes), nil
 }
 
 func (self EncryptedStream) Close() error {
@@ -86,15 +113,15 @@ func main() {
 	destination := flag.Args()[0]
 	port := flag.Args()[1]
 
-	aesCipher := generateCipher(generateKey(*pwdfile)) // generate aes cipher
+	aesKey := generateKey(*pwdfile)
 	if *listenport == "" {
-		client(aesCipher, destination, port)
+		client(aesKey, destination, port)
 	} else {
-		server(aesCipher, *listenport, destination, port)
+		server(aesKey, *listenport, destination, port)
 	}
 }
 
-func client(aesCipher cipher.AEAD, destination, port string) { // take in pwdfile, destination, port
+func client(aesKey []byte, destination, port string) { // take in pwdfile, destination, port
 		// create a connection to destination:port
 		conn, err := net.Dial("tcp", destination+":"+port)
 		if err != nil {
@@ -102,20 +129,16 @@ func client(aesCipher cipher.AEAD, destination, port string) { // take in pwdfil
 		}
 
 		// open a stream writer with the server connection
-		streamWriter := EncryptedStream{
-			Source: conn,
-			Cipher: aesCipher,
-		}
-
+		streamWriter := NewEncryptedStream(conn, aesKey)
 		stdInReader := io.ReadCloser(os.Stdin)
-		stdErrWriter := io.WriteCloser(os.Stderr)
+		stdOutWriter := io.WriteCloser(os.Stdout)
 
 		// make a channel to track the connection
 		done := make(chan bool)
 
 		// read response from server
 		go func () { // nonblocking recv from server -- get all responses from server
-			n, err := io.Copy(stdErrWriter, streamWriter)
+			n, err := io.Copy(stdOutWriter, streamWriter)
 			done <- true
 			if err != nil {
 				log.Println(err)
@@ -140,10 +163,10 @@ func client(aesCipher cipher.AEAD, destination, port string) { // take in pwdfil
 	// close both connections
 	streamWriter.Close() // when this connection handler exits, close the connection
 	stdInReader.Close()
-	stdErrWriter.Close()
+	stdOutWriter.Close()
 }
 
-func server(aesCipher cipher.AEAD, listenport, destination, port string) { // take in pwdfile, listenport
+func server(aesKey []byte, listenport, destination, port string) { // take in pwdfile, listenport
 	// listen on listenport
 	ln, err := net.Listen("tcp", ":"+listenport)
 	if err != nil {
@@ -157,10 +180,7 @@ func server(aesCipher cipher.AEAD, listenport, destination, port string) { // ta
 		if err != nil {
 			log.Fatal(err)
 		}
-		streamReader := EncryptedStream{
-			Source: conn,
-			Cipher: aesCipher,
-		}
+		streamReader := *NewEncryptedStream(conn, aesKey)
 
 		go handleConnection(streamReader, destination, port) // handle connection
 	}
@@ -226,12 +246,28 @@ func generateKey(pwdfile string) []byte {
 	return pbkdf2.Key([]byte(pwd), []byte(SALT), 4096, 32, sha256.New)
 }
 
-func generateCipher(key []byte) cipher.AEAD {
+func generateCipherBlock(key []byte) cipher.Block {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		panic(err.Error())
 	}
+	return block
+}
 
+func generateStreamCipher(block cipher.Block) cipher.Stream {
+	// Number only used once
+	iv := make([]byte, block.BlockSize())
+
+	// reads exactly NonceSize random bytes into nonce
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		panic(err.Error())
+	}
+
+	// create aes cipher
+	return cipher.NewCFBEncrypter(block, iv)
+}
+
+func generateCipher(block cipher.Block) cipher.AEAD {
 	// create aes cipher
 	aesCipher, err := cipher.NewGCM(block)
 	if err != nil {
