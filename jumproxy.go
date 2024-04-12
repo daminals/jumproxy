@@ -17,15 +17,14 @@ import (
 
 const (
 	SALT       = "THIS IS A VERY SECURE SALT. ZEBRA SMARTPHONE BANANA CLOWN"
-	BUFFER_SIZE = 4 // 4 bytes to hold the length of the encrypted stream
+	STREAM_SIZE_BUFFER = 4 // 4 bytes to hold the length of the encrypted stream
 )
-
 
 type EncryptedStream struct {
 	Source      io.ReadWriteCloser // implements io.Reader, io.Writer, io.Closer
 	Cipher      cipher.AEAD
 	Block 		 	cipher.Block
-	BufferSize  int
+	StreamSizeBuffer  int
 }
 
 func NewEncryptedStream(source io.ReadWriteCloser, key []byte) *EncryptedStream {
@@ -36,7 +35,7 @@ func NewEncryptedStream(source io.ReadWriteCloser, key []byte) *EncryptedStream 
 		Source:     source,
 		Cipher:     cipher,
 		Block:			block,
-		BufferSize: BUFFER_SIZE,
+		StreamSizeBuffer: STREAM_SIZE_BUFFER,
 	}
 }
 
@@ -56,7 +55,7 @@ func (self EncryptedStream) Write(byteStream []byte) (n int, err error) {
 	encryptedByteStream := self.Cipher.Seal(nonce, nonce, byteStream, nil)
 	encryptedStreamLen := len(encryptedByteStream)
 	// add a nice bufferSize byte head with the length of the encrypted stream
-	lenBuffer := make([]byte, self.BufferSize)
+	lenBuffer := make([]byte, self.StreamSizeBuffer)
 	if len(encryptedByteStream) > 0 {
 		// format the length of the encrypted stream into a byte array
 		binary.LittleEndian.PutUint16(lenBuffer, uint16(encryptedStreamLen))
@@ -81,7 +80,7 @@ func (self EncryptedStream) Read(byteStream []byte) (n int, err error) {
 	// decrypt the bytestream
 	ns := self.Cipher.NonceSize()
 	// read the length of the encrypted stream
-	lenInBytes, stream := byteStream[:self.BufferSize], byteStream[self.BufferSize:n]
+	lenInBytes, stream := byteStream[:self.StreamSizeBuffer], byteStream[self.StreamSizeBuffer:n]
 	Streamlen := int(binary.LittleEndian.Uint16(lenInBytes)) // conver to int
 	nonce, encryptedStream := stream[:ns], stream[ns:Streamlen]
 
