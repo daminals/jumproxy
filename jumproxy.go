@@ -12,13 +12,59 @@ import (
 	"os"
 	"encoding/binary"
 
+
 	pbkdf2 "golang.org/x/crypto/pbkdf2"
 )
 
 const (
 	SALT       = "THIS IS A VERY SECURE SALT. ZEBRA SMARTPHONE BANANA CLOWN"
-	STREAM_SIZE_BUFFER = 4 // 4 bytes to hold the length of the encrypted stream
+	STREAM_SIZE_BUFFER = 6 // 4 bytes to hold the length of the encrypted stream
 )
+
+type StreamPipe struct {
+	Src io.ReadWriteCloser
+	Dst io.ReadWriteCloser
+}
+
+func newStreamPipe(src, dst io.ReadWriteCloser) *StreamPipe {
+	return &StreamPipe{
+		Src: src,
+		Dst: dst,
+	}
+}
+
+func (self StreamPipe) Connect() {
+	// make a channel to track the connection
+	done := make(chan bool)
+
+	// read response from server
+	go func () { // nonblocking recv from server -- get all responses from server
+		n, err := io.Copy(self.Src, self.Dst)
+		done <- true
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		log.Println(n)
+	}()
+
+	// send the encrypted bytestream to the server
+	go func () {	
+		n, err := io.Copy(self.Dst, self.Src)
+		done <- true
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Println(n)
+	}()
+
+// wait until one of the connections closes
+<- done
+
+// close both connections
+self.Dst.Close() // when this connection handler exits, close the connection
+self.Src.Close()	
+}
 
 type StdStream struct {
 	Reader io.ReadCloser // implements io.Reader, io.Closer
@@ -140,6 +186,7 @@ func (self EncryptedStream) Close() error {
 }
 
 func main() {
+	log.SetOutput(io.Discard) // turn off logging
 	// go run jumproxy.go [-l listenport] -k pwdfile destination port
 	listenport := flag.String("l", "", "listenport")
 	pwdfile := flag.String("k", "", "pwdfile")
@@ -171,40 +218,11 @@ func client(aesKey []byte, destination, port string) { // take in pwdfile, desti
 
 		// open a stream writer with the server connection
 		streamWriter := NewEncryptedStream(conn, aesKey)
-		stdInReader := io.ReadCloser(os.Stdin)
-		stdOutWriter := io.WriteCloser(os.Stdout)
+		clientStream := NewStdStream()
 
-		// make a channel to track the connection
-		done := make(chan bool)
-
-		// read response from server
-		go func () { // nonblocking recv from server -- get all responses from server
-			n, err := io.Copy(stdOutWriter, streamWriter)
-			done <- true
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			log.Println(n)
-		}()
-
-		// send the encrypted bytestream to the server
-		go func () {	
-			n, err := io.Copy(streamWriter, stdInReader)
-			done <- true
-			if err != nil {
-				log.Fatal(err)
-			}
-			log.Println(n)
-		}()
-
-	// wait until one of the connections closes
-	<- done
-
-	// close both connections
-	streamWriter.Close() // when this connection handler exits, close the connection
-	stdInReader.Close()
-	stdOutWriter.Close()
+		// create a two-way stream with destination:port
+		pipe := newStreamPipe(clientStream, streamWriter)
+		pipe.Connect() // connect the two streams, block until connection dies
 }
 
 func server(aesKey []byte, listenport, destination, port string) { // take in pwdfile, listenport
@@ -236,35 +254,8 @@ func handleConnection(streamReader EncryptedStream, destination, port string) {
 		return
 	}
 
-	// make a channel to track the connection
-	done := make(chan bool)	
-
-	go func () { // nonblcking recv from dst -- get all responses from dst
-			n, err := io.Copy(streamReader, dst) 
-			done <- true
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			log.Println(n)
-		}()
-
-	go func () {
-		// send decrypted bytes to destination:port
-		_, err = io.Copy(dst, streamReader)
-		done <- true
-		if err != nil {
-			log.Println(err)
-			return
-		} 
-	}()
-
-	// wait until one of the connections closes
-	<- done
-
-	// close both connections
-	streamReader.Close() // when this connection handler exits, close the connection
-	dst.Close()
+	pipe := newStreamPipe(streamReader, dst)
+	pipe.Connect() // connect the two streams, block until connection dies
 }
 
 // passphrase using PBKDF2

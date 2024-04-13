@@ -7,6 +7,7 @@ Jumproxy utilizes a encrypted stream reader/writer, which implements the `io.Rea
 
 This approach allows streams to be encrypted/decrypted directly, without buffers. This is useful for proxy servers, as it allows the server to forward data directly from the client to the destination server, without storing the data in memory. It is also simpler to implement, since go provides an io.Copy function which can be used to easily forward data, calling on the specialized reader and writer interfaces.
 
+![Jumproxy Diagram](assets/jumproxy_diagram.png)
 
 ## Running Jumproxy
 To compile Jumproxy, you can use the following command:
