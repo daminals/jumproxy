@@ -20,6 +20,32 @@ const (
 	STREAM_SIZE_BUFFER = 4 // 4 bytes to hold the length of the encrypted stream
 )
 
+type StdStream struct {
+	Reader io.ReadCloser // implements io.Reader, io.Closer
+	Writer io.WriteCloser // implements io.Writer, io.Closer
+}
+
+func NewStdStream() *StdStream {
+	return &StdStream{
+		Reader: os.Stdin,
+		Writer: os.Stdout,
+	}
+}
+
+// Write implements io.Writer.
+func (self StdStream) Write(byteStream []byte) (n int, err error) {
+	return self.Writer.Write(byteStream)
+}
+
+func (self StdStream) Read(byteStream []byte) (n int, err error) {
+	return self.Reader.Read(byteStream)
+}
+
+func (self StdStream) Close() error {
+	self.Reader.Close()
+	return self.Writer.Close()
+}
+
 type EncryptedStream struct {
 	Source      io.ReadWriteCloser // implements io.Reader, io.Writer, io.Closer
 	Cipher      cipher.AEAD
@@ -74,23 +100,39 @@ func (self EncryptedStream) Write(byteStream []byte) (n int, err error) {
 func (self EncryptedStream) Read(byteStream []byte) (n int, err error) {
 	// read from the source stream (no buffer)
 	n, readErr := self.Source.Read(byteStream)
-	if n <= 0 {
-		return 0, readErr
+	if n == 0 {
+		return 0, io.EOF
+	}
+	if readErr != nil {
+		return n, readErr
 	}
 	// decrypt the bytestream
 	ns := self.Cipher.NonceSize()
-	// read the length of the encrypted stream
-	lenInBytes, stream := byteStream[:self.StreamSizeBuffer], byteStream[self.StreamSizeBuffer:n]
-	Streamlen := int(binary.LittleEndian.Uint16(lenInBytes)) // conver to int
-	nonce, encryptedStream := stream[:ns], stream[ns:Streamlen]
+	bytesRead := 0
+	byteStream = byteStream[:n] // chop off the extra bytes
+	decryptedByteStream := make([]byte, 0)
+	for bytesRead < n {
+		// get the start of this encrypted stream
+		start := bytesRead + self.StreamSizeBuffer
+		// read the length of the encrypted stream
+		lenInBytes := byteStream[bytesRead:start]
+		Streamlen := int(binary.LittleEndian.Uint16(lenInBytes)) // convert to int
+		// get the encrypted stream
+		end := start + Streamlen
+		stream := byteStream[start:end] // get the entire stream block
+		nonce, encryptedStream := stream[:ns], stream[ns:Streamlen] // get the nonce and the encrypted stream
+		bytesRead += Streamlen + self.StreamSizeBuffer // update the number of bytes read
 
-	decryptedBytes, err := self.Cipher.Open(nil, nonce, encryptedStream, nil)
-	if err != nil {
-		log.Println(err)
-		return len(decryptedBytes), err
+		decryptedBytes := make([]byte, 0)
+		decryptedBytes, err := self.Cipher.Open(decryptedBytes, nonce, encryptedStream, nil) // decrypt the stream
+		if err != nil {
+			log.Println(err)
+			return len(decryptedBytes), err
+		}
+		decryptedByteStream = append(decryptedByteStream, decryptedBytes...) // append the current decrypted stream to the decrypted byte stream
 	}
-	copy(byteStream, decryptedBytes)
-	return len(decryptedBytes), nil
+	copy(byteStream, decryptedByteStream)
+	return len(decryptedByteStream), nil
 }
 
 func (self EncryptedStream) Close() error {
